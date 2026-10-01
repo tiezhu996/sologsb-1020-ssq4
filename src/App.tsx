@@ -2,8 +2,14 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
+import type { ArchiveRecord, ArchiveState, CatalogField, FieldKey, MatchCandidate, RecordGroup } from './types';
 import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import {
+  buildOutbox, emptyCatalogState, ensureBaseSnapshot, exportReconciliation, pendingDecisionCount, pendingLocalChanges, reconcileSnapshot, settleOutbox
+} from './utils/reconcile';
+import {
+  ackFields, catalogStatus, ensureCatalog, fetchSnapshot, pushChange, serviceLog, simulateOfflineRevision, SyncInterruptedError
+} from './utils/catalogService';
 import { seedState } from './data/seed';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
@@ -11,6 +17,11 @@ const fieldLabels: Array<[FieldKey, string]> = [
   ['title', '标题'], ['date', '日期'], ['people', '人物'], ['places', '地点'], ['identifier', '编号'],
   ['medium', '载体'], ['extent', '数量'], ['rights', '权利'], ['notes', '备注']
 ];
+const catalogFieldLabels: Record<CatalogField, string> = { identifier: '编号', rights: '权利' };
+const syncPhaseLabels: Record<string, string> = {
+  idle: '待开始', push: '① 提交本机变更', fetch: '② 获取目录快照', reconcile: '③ 三方对账', done: '对账完成', interrupted: '发送中断 · 进度已保留'
+};
+const delay = (ms: number) => new Promise<void>((resolve) => { window.setTimeout(resolve, ms); });
 
 const parseDate = (value: string) => {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value.split('-').reverse().join('/');
@@ -41,6 +52,14 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const syncOpen = useSignal(false);
+  const syncing = useSignal(false);
+  const syncPhase = useSignal<'idle' | 'push' | 'fetch' | 'reconcile' | 'done' | 'interrupted'>('idle');
+  const syncLog = useSignal<string[]>([]);
+  const simulateInterrupt = useSignal(false);
+  const revisionNotes = useSignal<string[]>([]);
+  const serviceVersion = useSignal(0);
+  const catalogLog = useSignal<string[]>([]);
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
@@ -62,6 +81,8 @@ export default component$(() => {
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
+    // 对账状态不参与撤销重做，仅在持久化恢复时合并。
+    if (next.catalog) state.catalog = { ...emptyCatalogState(), ...next.catalog };
   };
 
   const notify = (message: string) => {
@@ -69,9 +90,9 @@ export default component$(() => {
     window.setTimeout(() => { if (toast.value === message) toast.value = ''; }, 2800);
   };
 
-  const commit = (action: string, detail: string, recordIds: string[] = []) => {
+  const commit = (action: string, detail: string, recordIds: string[] = [], channel: 'local' | 'sync' = 'local', after?: string) => {
     state.revision += 1;
-    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds });
+    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds, revision: state.revision, channel, after });
     state.audit = state.audit.slice(0, 300);
   };
 
@@ -107,6 +128,8 @@ export default component$(() => {
   const visibleMatches = useComputed$(() => filteredMatches.value.slice(0, 120));
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
+  const pendingSyncCount = useComputed$(() => pendingDecisionCount(state));
+  const pendingChangeCount = useComputed$(() => pendingLocalChanges(state));
 
   const updateMatch = $((id: string, status: MatchCandidate['status']) => {
     capture();
@@ -268,6 +291,153 @@ export default component$(() => {
     URL.revokeObjectURL(url);
   });
 
+  const openSync = $(() => {
+    ensureCatalog(state.records);
+    serviceVersion.value = catalogStatus().version;
+    catalogLog.value = serviceLog();
+    syncOpen.value = true;
+  });
+
+  /**
+   * 目录快照对账：先提交上次版本后的本机变更，再取新快照三方对账。
+   * 发送中断时已确认的回执保留在发件箱，重试同一批由目录侧幂等去重。
+   */
+  const runSync = $(async () => {
+    if (syncing.value) return;
+    ensureCatalog(state.records);
+    ensureBaseSnapshot(state);
+    syncing.value = true;
+    syncPhase.value = 'push';
+    syncLog.value = [];
+    const log = (message: string) => { syncLog.value = [...syncLog.value, message]; };
+    try {
+      const added = buildOutbox(state);
+      const queue = state.catalog.outbox.filter((item) => item.status !== 'acked');
+      log(`圈定上次版本（r${state.catalog.lastSyncedRevision}）后的本机变更 ${queue.length} 条${added ? `，新入箱 ${added} 条` : ''}`);
+      if (!queue.length) log('没有待提交的本机变更，直接获取目录快照');
+      // 模拟中断时，本批中间那一条在“写入已落库、回执未送达”处断开。
+      const interruptAt = simulateInterrupt.value && queue.length ? Math.floor((queue.length - 1) / 2) : -1;
+      let pushed = 0;
+      for (let index = 0; index < queue.length; index += 1) {
+        const item = queue[index];
+        item.attempts += 1;
+        await delay(180);
+        try {
+          const result = pushChange(item, index === interruptAt);
+          item.status = 'acked';
+          item.receipt = result.receipt;
+          item.deduped = result.duplicate;
+          item.ackedAt = new Date().toISOString();
+          pushed += 1;
+          log(`✓ ${item.summary} → 回执 ${result.receipt}${result.duplicate ? '（目录侧已登记，去重未重复写入）' : ''}${result.held.length ? ` · ${result.held.length} 个字段被目录暂扣待裁` : ''}`);
+        } catch (error) {
+          if (error instanceof SyncInterruptedError) {
+            log(`✗ 发送中断：「${item.summary}」回执未送达。已确认 ${pushed} 条的回执与进度已保留，重试不会重复写入`);
+            syncPhase.value = 'interrupted';
+            notify('发送中断：进度与成功回执已保留，可重试同一批');
+            return;
+          }
+          throw error;
+        }
+      }
+      syncPhase.value = 'fetch';
+      await delay(160);
+      const snapshot = fetchSnapshot();
+      log(`取得目录快照 v${snapshot.version}（上次对账至 v${state.catalog.lastVersion}），开始三方对账`);
+      syncPhase.value = 'reconcile';
+      await delay(160);
+      const report = reconcileSnapshot(state, snapshot);
+      report.pushed = pushed;
+      state.catalog.reports.unshift(report);
+      state.catalog.reports = state.catalog.reports.slice(0, 20);
+      // 同步是对账检查点：此后的撤销不再跨越本次对账，避免与目录基准脱节。
+      history.value = [];
+      future.value = [];
+      commit(
+        '目录对账',
+        `快照 v${report.fromVersion} → v${report.toVersion}：提交 ${report.pushed} 条、应用 ${report.applied} 项、待裁 ${report.conflicts} 项、留待处理 ${report.removedMerged} 条`,
+        [],
+        'sync'
+      );
+      settleOutbox(state);
+      report.detail.slice(0, 6).forEach((line) => log(`· ${line}`));
+      log(`对账完成：应用 ${report.applied} 项目录修订，${report.conflicts} 项待裁，${report.removedMerged} 条留待处理`);
+      syncPhase.value = 'done';
+      serviceVersion.value = catalogStatus().version;
+      catalogLog.value = serviceLog();
+      notify(report.conflicts || report.removedMerged ? '对账完成，有待裁项或留待处理记录' : '对账完成，本机与目录已对齐');
+    } finally {
+      syncing.value = false;
+    }
+  });
+
+  const simulateRevision = $(() => {
+    ensureCatalog(state.records);
+    const mergedIds = state.merges.flatMap((merge) => [merge.leftId, merge.rightId]);
+    const notes = simulateOfflineRevision(state.records, mergedIds);
+    revisionNotes.value = notes;
+    serviceVersion.value = catalogStatus().version;
+    catalogLog.value = serviceLog();
+    notify(notes.length ? `目录离线修订 ${notes.length} 项，下次同步时对账` : '目录当前没有可修订的记录');
+  });
+
+  const resolveConflict = $((id: string, winner: 'local' | 'catalog') => {
+    const conflict = state.catalog.conflicts.find((item) => item.id === id);
+    if (!conflict || conflict.status !== 'pending') return;
+    conflict.status = 'resolved';
+    conflict.resolution = winner;
+    conflict.resolvedAt = new Date().toISOString();
+    const record = state.records.find((item) => item.id === conflict.recordId);
+    const label = catalogFieldLabels[conflict.field];
+    if (winner === 'catalog') {
+      if (record) {
+        record[conflict.field] = conflict.catalogValue;
+        record.updatedAt = new Date().toISOString();
+      }
+      ackFields(conflict.recordId, [conflict.field]);
+      commit('对账裁决', `「${conflict.recordTitle}」的${label}采用目录值：${conflict.catalogValue || '（空）'}`, [conflict.recordId], 'sync');
+      notify(`已采用目录值更新本机${label}`);
+    } else {
+      // 保留本机：生成断言变更进入发件箱，下次同步提交目录。
+      const payload = JSON.stringify({ kind: 'assert', recordId: conflict.recordId, field: conflict.field, value: conflict.localValue });
+      commit('对账裁决', `「${conflict.recordTitle}」的${label}保留本机值：${conflict.localValue || '（空）'}，待下次同步提交目录`, [conflict.recordId], 'local', payload);
+      notify(`已裁决保留本机${label}，下次同步提交目录`);
+    }
+  });
+
+  const resolveRemovedMerged = $((id: string, decision: 'kept' | 'dropped') => {
+    const item = state.catalog.removedMerged.find((entry) => entry.id === id);
+    if (!item || item.status !== 'pending') return;
+    item.status = decision;
+    item.resolvedAt = new Date().toISOString();
+    const surviving = state.records.find((record) => record.id === item.recordId);
+    if (decision === 'kept') {
+      if (surviving) {
+        const payload = JSON.stringify({ kind: 'assert', recordId: item.recordId, field: 'alive', value: 'true' });
+        commit('对账裁决', `保留合并结果：「${item.recordTitle}」的合并结论维持有效，下次同步提请目录恢复存活`, [item.recordId], 'local', payload);
+      } else {
+        commit('对账裁决', `保留合并结果：「${item.recordTitle}」已被合并吸收，目录移除与合并结论一致`, [item.recordId], 'sync');
+      }
+      notify('已保留合并结果');
+    } else {
+      if (surviving) surviving.catalogRemoved = true;
+      commit('对账裁决', `接受目录移除：「${item.recordTitle}」按目录结论标记为已移除`, [item.recordId], 'sync');
+      notify('已接受目录移除结论');
+    }
+  });
+
+  const exportRecon = $(() => {
+    const data = exportReconciliation(state, serviceLog());
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `目录快照对账记录-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify('对账记录已导出');
+  });
+
   const moveReview = $((delta: number) => {
     const list = filteredMatches.value;
     const index = list.findIndex((match) => match.id === activeMatch.value?.id);
@@ -288,11 +458,20 @@ export default component$(() => {
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
+    ensureCatalog(state.records);
+    ensureBaseSnapshot(state);
     state.hydrated = true;
   });
 
   useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
+    const payload = track(() => JSON.stringify({
+      revision: state.revision,
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit,
+      catalog: state.catalog
+    }));
     if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
   });
 
@@ -331,6 +510,10 @@ export default component$(() => {
         <div class="top-actions">
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button class="button ghost sync-entry" onClick$={openSync}>
+            目录对账 · v{state.catalog.lastVersion}
+            {(pendingSyncCount.value + pendingChangeCount.value) > 0 && <span class="sync-badge">{pendingSyncCount.value + pendingChangeCount.value}</span>}
+          </button>
           <button class="button ghost" onClick$={() => importOpen.value = true}>导入两组记录</button>
           <button class="button light" onClick$={exportAudit}>导出核对包</button>
         </div>
@@ -419,7 +602,10 @@ export default component$(() => {
                 <strong>{record.title}</strong>
                 <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
                 <code>{record.identifier}</code>
-                <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                <span class="status-cell">
+                  <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                  {record.catalogRemoved && <span class="removed-flag" title="馆藏目录已移除该记录，本机数据保留待处理">目录已移除</span>}
+                </span>
               </div>
             ))}
           </div>
@@ -509,6 +695,112 @@ export default component$(() => {
               <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" onClick$={mergeCurrent}>生成合并记录</button></Modal.Footer>
             </>;
           })()}
+        </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={syncOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel sync-modal">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">CATALOG SYNC</span><Modal.Title>目录快照对账</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">
+            馆藏目录管编号、权利与记录存活；本机工作区管匹配结论、字段选择与审计轨迹。同步先提交上次版本后的本机变更，再取新快照三方对账：双方改同一字段列入待裁项，目录移除而本机已合并的记录留待处理。发送中断保留进度与回执，重试同一批不会重复写入。
+          </Modal.Description>
+
+          <div class="sync-metrics">
+            <div><strong>v{serviceVersion.value}</strong><span>目录当前版本</span></div>
+            <div><strong>v{state.catalog.lastVersion}</strong><span>已对账至</span></div>
+            <div><strong>{pendingChangeCount.value}</strong><span>待提交变更</span></div>
+            <div class={state.catalog.conflicts.some((item) => item.status === 'pending') ? 'warn' : ''}><strong>{state.catalog.conflicts.filter((item) => item.status === 'pending').length}</strong><span>待裁项</span></div>
+            <div class={state.catalog.removedMerged.some((item) => item.status === 'pending') ? 'warn' : ''}><strong>{state.catalog.removedMerged.filter((item) => item.status === 'pending').length}</strong><span>留待处理</span></div>
+          </div>
+
+          <div class="sync-controls">
+            <button class="button primary" disabled={syncing.value} onClick$={runSync}>
+              {syncing.value ? '同步中…' : syncPhase.value === 'interrupted' ? '重试同一批' : '开始同步'}
+            </button>
+            <button class="button ghost" disabled={syncing.value} onClick$={simulateRevision}>模拟目录离线修订</button>
+            <label class="interrupt-toggle" title="模拟“写入已落库、回执未送达”的中断场景">
+              <input type="checkbox" checked={simulateInterrupt.value} onChange$={(event) => { simulateInterrupt.value = (event.target as HTMLInputElement).checked; }} />
+              模拟发送中断
+            </label>
+            <button class="button light" onClick$={exportRecon}>导出对账记录</button>
+          </div>
+
+          {revisionNotes.value.length > 0 && (
+            <div class="revision-notes">
+              <strong>目录离线修订记录</strong>
+              {revisionNotes.value.map((note, index) => <p key={index}>{note}</p>)}
+            </div>
+          )}
+
+          {syncLog.value.length > 0 && (
+            <div class="sync-progress">
+              <div class="sync-phase-line"><span class={`phase-dot ${syncPhase.value}`} />{syncPhaseLabels[syncPhase.value]}</div>
+              <div class="sync-log">{syncLog.value.map((line, index) => <p key={index}>{line}</p>)}</div>
+            </div>
+          )}
+
+          <div class="sync-section">
+            <h4>待裁项<span>{state.catalog.conflicts.filter((item) => item.status === 'pending').length} 项待裁</span></h4>
+            {state.catalog.conflicts.length ? [...state.catalog.conflicts].sort((a, b) => (a.status === b.status ? 0 : a.status === 'pending' ? -1 : 1)).map((conflict) => (
+              <div class={`conflict-card ${conflict.status}`} key={conflict.id}>
+                <div class="conflict-head">
+                  <strong>{conflict.recordTitle}</strong>
+                  <span class="field-tag">{catalogFieldLabels[conflict.field]}</span>
+                  {conflict.status === 'resolved' && <span class="resolved-tag">已裁决：{conflict.resolution === 'local' ? '保留本机' : '采用目录'}</span>}
+                </div>
+                <div class="conflict-values">
+                  <div><small>上次同步基准</small><span>{conflict.baseValue || '（空）'}</span></div>
+                  <div class="local"><small>本机值</small><span>{conflict.localValue || '（空）'}</span></div>
+                  <div class="catalog"><small>目录值</small><span>{conflict.catalogValue || '（空）'}</span></div>
+                </div>
+                {conflict.status === 'pending' && (
+                  <div class="conflict-actions">
+                    <button class="button small" onClick$={() => resolveConflict(conflict.id, 'local')}>保留本机值</button>
+                    <button class="button small ghost" onClick$={() => resolveConflict(conflict.id, 'catalog')}>采用目录值</button>
+                  </div>
+                )}
+              </div>
+            )) : <div class="empty-state slim">双方同时修改同一字段时，会在这里列出基准值、本机值和目录值供裁决。</div>}
+          </div>
+
+          <div class="sync-section">
+            <h4>留待处理<span>{state.catalog.removedMerged.filter((item) => item.status === 'pending').length} 条待处理</span></h4>
+            {state.catalog.removedMerged.length ? state.catalog.removedMerged.map((item) => (
+              <div class={`conflict-card removed ${item.status}`} key={item.id}>
+                <div class="conflict-head">
+                  <strong>{item.recordTitle}</strong>
+                  <span class="field-tag danger">目录已移除</span>
+                  {item.status !== 'pending' && <span class="resolved-tag">{item.status === 'kept' ? '已保留合并结果' : '已接受目录移除'}</span>}
+                </div>
+                <p class="removed-note">{item.note}</p>
+                {item.status === 'pending' && (
+                  <div class="conflict-actions">
+                    <button class="button small" onClick$={() => resolveRemovedMerged(item.id, 'kept')}>保留合并结果</button>
+                    <button class="button small ghost" onClick$={() => resolveRemovedMerged(item.id, 'dropped')}>接受目录移除</button>
+                  </div>
+                )}
+              </div>
+            )) : <div class="empty-state slim">目录移除而本机已合并的记录会留在这里，等待人工处理。</div>}
+          </div>
+
+          <div class="sync-section">
+            <h4>对账报告<span>{state.catalog.reports.length} 份</span></h4>
+            {state.catalog.reports.length ? state.catalog.reports.slice(0, 5).map((report) => (
+              <details class="report-row" key={report.id}>
+                <summary>
+                  <time>{new Date(report.at).toLocaleString('zh-CN')}</time>
+                  <span>v{report.fromVersion} → v{report.toVersion}</span>
+                  <span>提交 {report.pushed} · 应用 {report.applied} · 待裁 {report.conflicts} · 留待 {report.removedMerged}</span>
+                </summary>
+                <ul>{report.detail.map((line, index) => <li key={index}>{line}</li>)}</ul>
+              </details>
+            )) : <div class="empty-state slim">完成一次同步后，这里会列出每轮对账的提交、应用与待裁统计。</div>}
+          </div>
+
+          <details class="service-log">
+            <summary>目录服务写入日志（{catalogLog.value.length} 条，用于核对重试未造成重复写入）</summary>
+            <ul>{catalogLog.value.slice(0, 30).map((line, index) => <li key={index}>{line}</li>)}</ul>
+          </details>
         </Modal.Panel>
       </Modal.Root>
     </div>

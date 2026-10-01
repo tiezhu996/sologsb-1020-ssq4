@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --mode ssr",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:reconcile": "node --no-warnings --loader ./scripts/esbuild-register.mjs scripts/smoke-reconcile.mjs"
   },
   "dependencies": {
     "@builder.io/qwik": "^1.20.1",
