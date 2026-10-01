@@ -2,9 +2,18 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
+import type {
+  ArchiveRecord, ArchiveState, CatalogRecordSnapshot, FieldKey, FieldResolution,
+  MatchCandidate, RecordGroup, SurvivalResolution
+} from './types';
 import { computeMatches, fieldValue, scorePair } from './utils/matching';
 import { seedState } from './data/seed';
+import { SyncModal } from './components/SyncModal';
+import {
+  abandonPush, applyCurrentReport, dismissReport, ensureBaseline, exportableReconciliation,
+  importAddition, runPush, setResolution, simulateAbort
+} from './sync/orchestrator';
+import { publishDemoRevision, publishManualRevision } from './sync/demoRevision';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
 const fieldLabels: Array<[FieldKey, string]> = [
@@ -41,13 +50,17 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const syncOpen = useSignal(false);
+  const syncRunning = useSignal(false);
+  const pushProgress = useSignal('');
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
     records: state.records,
     matches: state.matches,
     merges: state.merges,
-    audit: state.audit
+    audit: state.audit,
+    sync: state.sync
   });
 
   const capture = () => {
@@ -62,6 +75,7 @@ export default component$(() => {
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
+    if (next.sync) state.sync = { ...state.sync, ...next.sync };
   };
 
   const notify = (message: string) => {
@@ -169,9 +183,14 @@ export default component$(() => {
       const pick = source === 'combine' ? `${fieldValue(left, field)}；${fieldValue(right, field)}` : fieldValue(source === 'A' ? left : right, field);
       values[field] = pick;
     });
+    const catalogAnchor = choices.identifier === 'B'
+      ? right.catalogId ?? right.identifier
+      : left.catalogId ?? left.identifier;
     const merged: ArchiveRecord = {
       ...left,
       ...values,
+      id: crypto.randomUUID(),
+      catalogId: catalogAnchor,
       people: values.people?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.people,
       places: values.places?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.places,
       status: 'merged',
@@ -179,7 +198,7 @@ export default component$(() => {
     };
     state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
     state.matches.forEach((item) => {
-      if (item.id === match.id) item.status = 'merged';
+      if (item.id === match.id) { item.status = 'merged'; item.reviewedAt = new Date().toISOString(); }
       else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
     });
     state.merges.unshift({
@@ -189,6 +208,11 @@ export default component$(() => {
       rightId: right.id,
       chosen: { ...choices },
       values,
+      mergedRecordId: merged.id,
+      leftCatalogId: left.catalogId ?? left.identifier,
+      rightCatalogId: right.catalogId ?? right.identifier,
+      leftIdentifier: left.identifier,
+      rightIdentifier: right.identifier,
       mergedAt: new Date().toISOString()
     });
     commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
@@ -259,13 +283,140 @@ export default component$(() => {
   });
 
   const exportAudit = $(() => {
-    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), records: state.records, matches: state.matches, merges: state.merges, audit: state.audit, sync: state.sync }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = `档案元数据核对结果-${new Date().toISOString().slice(0, 10)}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  });
+
+  // ── 目录快照同步 ────────────────────────────────────────────────
+  const seedCatalogFromRecords = (): CatalogRecordSnapshot[] => {
+    const seen = new Set<string>();
+    const snapshots: CatalogRecordSnapshot[] = [];
+    state.records.forEach((record) => {
+      const catalogId = record.catalogId || record.identifier;
+      if (!catalogId || seen.has(catalogId)) return;
+      seen.add(catalogId);
+      record.catalogId = catalogId; // 首次建基线时把目录锚点回填到记录
+      snapshots.push({
+        catalogId,
+        identifier: record.identifier,
+        rights: record.rights,
+        alive: true,
+        updatedAt: record.updatedAt
+      });
+    });
+    return snapshots;
+  };
+
+  const runSync = $(async () => {
+    if (syncRunning.value) return;
+    syncRunning.value = true;
+    try {
+      ensureBaseline(state, seedCatalogFromRecords());
+      const startedAcked = state.sync.ackedBatches.length;
+      const result = await runPush(state, {
+        onPushProgress: (acked, total) => {
+          pushProgress.value = `已提交 ${acked}/${total} 批本机结论…`;
+        },
+        onPhase: (phase) => { state.sync.phase = phase; }
+      });
+      const newAcked = state.sync.ackedBatches.length - startedAcked;
+      if (result === 'interrupted') {
+        notify(newAcked > 0 ? `发送中断：已保留 ${newAcked} 批成功回执，可重试同一批` : '发送中断，进度已保留，重试不会重复写入');
+      } else if (state.sync.phase === 'review' && state.sync.report) {
+        const report = state.sync.report;
+        commit(
+          '拉取目录快照并完成对账',
+          `v${report.baselineVersion} → v${report.incomingVersion}：${report.autoChanges.length} 项自动应用、${report.pending.length} 项待处理、${report.additions.length} 项目录新增`,
+          []
+        );
+        notify(`对账完成：${report.autoChanges.length} 项自动应用，${report.pending.length} 项待裁决`);
+      }
+    } catch (error) {
+      notify(`同步失败：${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      syncRunning.value = false;
+      pushProgress.value = '';
+    }
+  });
+
+  const abortSync = $(() => {
+    simulateAbort();
+    notify('已模拟发送中断');
+  });
+
+  const abandon = $(() => {
+    capture();
+    abandonPush(state);
+    commit('放弃中断的发送', '保留已成功批次回执，下次同步只发送剩余结论', []);
+    notify('已保留回执并停止本轮发送');
+  });
+
+  const resolveItem = $((itemId: string, resolution: FieldResolution | SurvivalResolution) => {
+    setResolution(state, itemId, resolution);
+  });
+
+  const importCatalogAddition = $((catalogId: string) => {
+    capture();
+    const record = importAddition(state, catalogId);
+    if (record) {
+      state.matches = computeMatches(state.records);
+      commit('导入目录新增记录', `目录新记录 ${catalogId} 已加入本机工作区并重新匹配`, [record.id]);
+      notify('目录新增记录已导入本机');
+    }
+  });
+
+  const applyReconciliation = $(() => {
+    const report = state.sync.report;
+    if (!report) return;
+    if (!report.pending.every((item) => report.resolutions[item.id])) {
+      notify('还有待裁项未选择处理方式');
+      return;
+    }
+    capture();
+    const importedIds = new Set(report.additions.map((item) => item.catalogId).filter((id) =>
+      state.records.some((record) => record.catalogId === id)
+    ));
+    const summary = applyCurrentReport(state, importedIds);
+    state.matches = computeMatches(state.records);
+    commit(
+      '应用目录对账结果',
+      `自动修订 ${summary.appliedAuto} 个字段、自动删除 ${summary.appliedDeletions} 条、字段裁决 ${summary.fieldCount} 项、存活裁决 ${summary.survivalCount} 项、导入新增 ${summary.imported} 条`,
+      []
+    );
+    notify('对账结果已应用，基线已推进到新快照版本');
+  });
+
+  const closeReport = $(() => dismissReport(state));
+
+  const exportReconciliation = $(() => {
+    const payload = exportableReconciliation(state);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `目录对账记录-v${payload.incoming?.version ?? payload.baseline?.version ?? 0}-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify('对账记录已导出');
+  });
+
+  const triggerDemoRevision = $(() => {
+    ensureBaseline(state, seedCatalogFromRecords());
+    const snapshot = publishDemoRevision(state.records, state.merges);
+    commit('模拟目录离线修订', `馆藏目录发布新版本 v${snapshot.version}（编号、权利、存活与新增）`, []);
+    notify(`馆藏目录已发布离线修订 v${snapshot.version}，现在开始同步即可看到对账`);
+  });
+
+  const triggerManualRevision = $((payload: { catalogId: string; identifier?: string; rights?: string; alive?: boolean }) => {
+    ensureBaseline(state, seedCatalogFromRecords());
+    const snapshot = publishManualRevision([payload]);
+    commit('手动修订目录记录', `馆藏目录发布 v${snapshot.version}：${payload.catalogId}`, []);
+    notify(`目录修订已发布（v${snapshot.version}）`);
   });
 
   const moveReview = $((delta: number) => {
@@ -289,10 +440,18 @@ export default component$(() => {
       localStorage.removeItem(STORAGE_KEY);
     }
     state.hydrated = true;
+    // 首次进入：以当前工作区记录建立目录基线快照（目录编号 = 记录编号）
+    if (!state.sync.baseline) {
+      const baseline = ensureBaseline(state, seedCatalogFromRecords());
+      commit('建立目录基线', `以 ${baseline.records.length} 条本机记录建立馆藏目录基线快照 v1`, []);
+    }
   });
 
   useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
+    const payload = track(() => JSON.stringify({
+      revision: state.revision, records: state.records, matches: state.matches,
+      merges: state.merges, audit: state.audit, sync: state.sync
+    }));
     if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
   });
 
@@ -332,6 +491,15 @@ export default component$(() => {
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="button ghost" onClick$={() => importOpen.value = true}>导入两组记录</button>
+          <button
+            class={`button sync-button ${state.sync.phase === 'interrupted' ? 'danger' : state.sync.phase === 'review' ? 'warn' : ''}`}
+            onClick$={() => syncOpen.value = true}
+          >
+            目录同步
+            <small>v{state.sync.baseline?.version ?? '—'}</small>
+            {state.sync.phase === 'interrupted' && <i class="sync-badge danger">中断</i>}
+            {state.sync.phase === 'review' && <i class="sync-badge warn">{state.sync.report?.pending.length ?? 0} 待裁</i>}
+          </button>
           <button class="button light" onClick$={exportAudit}>导出核对包</button>
         </div>
       </header>
@@ -419,7 +587,10 @@ export default component$(() => {
                 <strong>{record.title}</strong>
                 <span>{parseDate(record.date)}<small>{record.people.join('、')} · {record.places.join('、')}</small></span>
                 <code>{record.identifier}</code>
-                <span class={`record-status ${record.status}`}>{record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                <span class={`record-status ${record.status}`}>
+                  {record.status === 'unreviewed' ? '未核对' : record.status === 'confirmed' ? '已确认' : record.status === 'rejected' ? '已忽略' : '已合并'}
+                  {record.catalogHold && <i class="hold-badge" title="目录已移除，本机裁决保留">目录已移除</i>}
+                </span>
               </div>
             ))}
           </div>
@@ -469,6 +640,7 @@ export default component$(() => {
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
           <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
           <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>4</span><p>编号、权利与记录存活归馆藏目录管辖；同步先提交本机结论再取快照，双方同改字段列待裁，目录删除而本机已合并的记录留待存活裁决。</p></div>
         </article>
       </section>
 
@@ -487,6 +659,24 @@ export default component$(() => {
           {importText.value && <div class="file-name">已读取：{importText.value}</div>}
           <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" disabled={!importRaw.value.trim()} onClick$={parseImport}>导入并重新匹配</button></Modal.Footer>
         </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={syncOpen} closeOnBackdropClick={state.sync.phase === 'idle'}>
+        <SyncModal
+          state={state}
+          running={syncRunning}
+          pushProgress={pushProgress}
+          onRunSync={runSync}
+          onAbort={abortSync}
+          onAbandon={abandon}
+          onResolve={resolveItem}
+          onImport={importCatalogAddition}
+          onApply={applyReconciliation}
+          onCloseReport={closeReport}
+          onExport={exportReconciliation}
+          onDemoRevision={triggerDemoRevision}
+          onManualRevision={triggerManualRevision}
+        />
       </Modal.Root>
 
       <Modal.Root bind:show={mergeOpen} closeOnBackdropClick>
